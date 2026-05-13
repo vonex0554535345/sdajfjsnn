@@ -107,23 +107,21 @@ async def execute_task(client: Client, task: str) -> str:
         for tool_call in msg.tool_calls:
             if tool_call.function.name == "send_message":
                 args = json.loads(tool_call.function.arguments)
-                chat_name = args["chat_name"]
+                chat_name = args["chat_name"].strip()
+                text_to_send = args["text"]
+                logger.info("Tool call: send_message to '%s'", chat_name)
                 try:
-                    import re
-                    username_match = re.search(r"@?([\w]+)", chat_name)
-                    chat = find_chat(chat_name, dialogs)
-                    if chat:
-                        target = chat["id"]
-                        label = chat["name"]
-                    elif username_match:
-                        target = username_match.group(1)
-                        label = f"@{target}"
+                    # Try by username directly (strip @ if present)
+                    if "@" in chat_name:
+                        target = chat_name.lstrip("@")
                     else:
-                        results.append(f"❌ Не нашёл контакт: {chat_name}")
-                        continue
-                    await client.send_message(target, args["text"])
-                    results.append(f"✅ Написал {label}: «{args['text']}»")
+                        # Search in dialogs by name
+                        found = find_chat(chat_name, dialogs)
+                        target = found["id"] if found else chat_name
+                    await client.send_message(target, text_to_send)
+                    results.append(f"✅ Написал {chat_name}: «{text_to_send}»")
                 except Exception as e:
+                    logger.error("Send error: %s", e)
                     results.append(f"❌ Ошибка отправки {chat_name}: {e}")
 
     if results:
