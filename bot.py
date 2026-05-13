@@ -22,6 +22,7 @@ MAX_HISTORY = int(os.environ.get("MAX_HISTORY", "20"))
 groq_client = Groq(api_key=GROQ_API_KEY)
 histories: dict[int, list[dict]] = {}
 is_active = True
+blocked_users: set[str] = set()  # usernames without @
 me_id: int = None
 dialogs_cache: list[dict] = []
 
@@ -158,14 +159,28 @@ async def handle_saved_message(client: Client, message: Message) -> None:
 
     text = message.text.strip()
 
-    if text == "/on":
-        is_active = True
-        await client.send_message("me", "Автоответ включён ✅")
+    if text.startswith("/on") or text.startswith("/off"):
+        parts = text.split()
+        cmd = parts[0]
+        username = parts[1].lstrip("@").lower() if len(parts) > 1 else None
+
+        if username:
+            if cmd == "/on":
+                blocked_users.discard(username)
+                await client.send_message("me", f"Автоответ для @{username} включён ✅")
+            else:
+                blocked_users.add(username)
+                await client.send_message("me", f"Автоответ для @{username} выключен ❌")
+        else:
+            if cmd == "/on":
+                is_active = True
+                blocked_users.clear()
+                await client.send_message("me", "Автоответ для всех включён ✅")
+            else:
+                is_active = False
+                await client.send_message("me", "Автоответ для всех выключен ❌")
         return
-    if text == "/off":
-        is_active = False
-        await client.send_message("me", "Автоответ выключен ❌")
-        return
+
     if text.startswith("/"):
         return
 
@@ -181,6 +196,9 @@ async def handle_saved_message(client: Client, message: Message) -> None:
 @app.on_message(filters.private & filters.incoming & ~filters.me)
 async def handle_incoming(client: Client, message: Message) -> None:
     if not is_active or not message.text:
+        return
+    sender_username = (message.from_user.username or "").lower()
+    if sender_username and sender_username in blocked_users:
         return
 
     user_id = message.from_user.id
