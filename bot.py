@@ -115,13 +115,22 @@ app = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION
 
 @app.on_message(filters.me & filters.private)
 async def handle_saved_message(client: Client, message: Message) -> None:
-    global me_id
+    global me_id, is_active
     if me_id is None:
         me_id = (await client.get_me()).id
     if message.chat.id != me_id or not message.text:
         return
 
-    text = message.text
+    text = message.text.strip()
+
+    if text == "/on":
+        is_active = True
+        await client.send_message("me", "Автоответ включён ✅")
+        return
+    if text == "/off":
+        is_active = False
+        await client.send_message("me", "Автоответ выключен ❌")
+        return
     if text.startswith("/"):
         return
 
@@ -132,14 +141,6 @@ async def handle_saved_message(client: Client, message: Message) -> None:
     except Exception as e:
         logger.error("Task error: %s", e)
         await client.send_message("me", f"❌ Ошибка: {e}")
-
-
-@app.on_message(filters.me & filters.command(["on", "off"], prefixes="/"))
-async def toggle(client: Client, message: Message) -> None:
-    global is_active
-    is_active = message.command[0] == "on"
-    status = "включён ✅" if is_active else "выключен ❌"
-    await message.reply_text(f"Автоответ {status}")
 
 
 @app.on_message(filters.private & filters.incoming & ~filters.me)
