@@ -42,12 +42,21 @@ async def load_dialogs(client: Client) -> list[dict]:
 
 
 def find_chat(name: str, dialogs: list[dict]) -> dict | None:
-    name_lower = name.lower()
+    import re
+    # Strip "(@username)" part if Groq included it
+    clean = re.sub(r"\s*\(@[^)]*\)", "", name).strip().lower()
+    username_match = re.search(r"@([\w]+)", name)
+    extracted_username = username_match.group(1).lower() if username_match else ""
+
     for d in dialogs:
-        if name_lower == d["name"].lower() or name_lower == d["username"].lower():
+        d_name = d["name"].lower()
+        d_user = d["username"].lower()
+        if clean == d_name or (extracted_username and extracted_username == d_user):
             return d
     for d in dialogs:
-        if name_lower in d["name"].lower() or name_lower in d["username"].lower():
+        d_name = d["name"].lower()
+        d_user = d["username"].lower()
+        if clean in d_name or d_name in clean or (extracted_username and extracted_username in d_user):
             return d
     return None
 
