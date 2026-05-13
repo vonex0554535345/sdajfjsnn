@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+auth.py
+auth_state.json
+generate_session.py
+*.session
+tmp_session*
