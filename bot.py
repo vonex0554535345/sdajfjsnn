@@ -627,20 +627,17 @@ async def main() -> None:
     await load_settings_from_db()
     logger.info("DB ready. Monitoring %d chat(s).", len(_monitor_chats))
 
-    await app.start()
-    me_id = (await app.get_me()).id
-    logger.info("Userbot started (me_id=%s)", me_id)
+    async with app:
+        me_id = (await app.get_me()).id
+        logger.info("Userbot started (me_id=%s)", me_id)
 
-    if notify_bot:
-        await notify_bot.start()
-        logger.info("Notify-bot started.")
-    else:
-        logger.warning("No TELEGRAM_BOT_TOKEN set.")
-
-    await idle()
-    await app.stop()
-    if notify_bot:
-        await notify_bot.stop()
+        if notify_bot:
+            async with notify_bot:
+                logger.info("Notify-bot started.")
+                await idle()
+        else:
+            logger.warning("No TELEGRAM_BOT_TOKEN set.")
+            await idle()
 
 
 asyncio.run(main())
