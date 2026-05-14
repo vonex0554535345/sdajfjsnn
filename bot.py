@@ -630,7 +630,13 @@ async def main() -> None:
 
         if notify_bot:
             async with notify_bot:
-                logger.info("Notify-bot started.")
+                bot_info = await notify_bot.get_me()
+                logger.info("Notify-bot started: @%s (id=%s)", bot_info.username, bot_info.id)
+                try:
+                    await notify_bot.send_message(me_id, f"Бот @{bot_info.username} запущен! Напиши /start")
+                    logger.info("Startup message sent to owner")
+                except Exception as e:
+                    logger.error("Cannot message owner (did you /start the bot?): %s", e)
                 await idle()
         else:
             logger.warning("No TELEGRAM_BOT_TOKEN set.")
