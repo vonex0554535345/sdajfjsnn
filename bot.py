@@ -245,23 +245,69 @@ async def find_design_chats(keywords: list[str] | None = None, max_per_kw: int =
     return sorted(found, key=lambda x: x['members'], reverse=True)
 
 
+def _build_intro_msg() -> str:
+    intro     = _cfg.get("intro_text", "").strip()
+    portfolio = _cfg.get("portfolio_url", "").strip()
+    base = intro if intro else (
+        "Привет! Я дизайнер, ищу интересные заказы. "
+        "Работаю с веб-дизайном, лендингами, логотипами, баннерами и UI/UX. "
+        "Если есть задачи — пишите в личку!"
+    )
+    return f"{base}\n\nПортфолио: {portfolio}" if portfolio else base
+
+
 async def join_and_monitor(chats: list[dict], limit: int = 500) -> list[str]:
-    joined: list[str] = []
+    joined:  list[str] = []
+    skipped: list[str] = []
+    already_monitored = {cid for cid, _ in await db_get_monitor_chats()}
+
     for info in chats[:limit]:
+        newly_joined = False
+        chat_obj     = None
         try:
             try:
-                chat_obj = await app.join_chat(info['username'])
+                chat_obj     = await app.join_chat(info['username'])
+                newly_joined = True
+                await asyncio.sleep(random.uniform(3, 6))
             except Exception as join_err:
                 if "already" in str(join_err).lower():
                     chat_obj = await app.get_chat(info['username'])
                 else:
                     raise
-            await db_add_monitor_chat(chat_obj.id, info['title'])
-            joined.append(info['title'])
-            logger.info("Joined+monitoring: %s (id=%s)", info['title'], chat_obj.id)
+
+            # Already in monitoring list — skip silently
+            if chat_obj.id in already_monitored:
+                continue
+
+            if newly_joined:
+                # Test: try to send intro message
+                try:
+                    await app.send_message(chat_obj.id, _build_intro_msg())
+                    await db_add_monitor_chat(chat_obj.id, info['title'])
+                    already_monitored.add(chat_obj.id)
+                    joined.append(info['title'])
+                    logger.info("Joined+posted+monitoring: %s (id=%s)", info['title'], chat_obj.id)
+                except Exception as send_err:
+                    # Can't post → leave and ignore this chat
+                    logger.warning("Can't post in %s (%s) — leaving", info['title'], send_err)
+                    skipped.append(info['title'])
+                    try:
+                        await app.leave_chat(chat_obj.id)
+                    except Exception:
+                        pass
+            else:
+                # Was already a member — add to monitoring without test
+                await db_add_monitor_chat(chat_obj.id, info['title'])
+                already_monitored.add(chat_obj.id)
+                joined.append(info['title'])
+                logger.info("Already member, now monitoring: %s", info['title'])
+
             await asyncio.sleep(random.uniform(6, 12))
         except Exception as e:
             logger.warning("Could not join %s: %s", info['username'], e)
+
+    if skipped:
+        logger.info("Left %d chat(s) where posting is restricted: %s", len(skipped), skipped)
     return joined
 
 
@@ -412,8 +458,10 @@ async def cmd_help(message: BotMessage) -> None:
         "Когда AI находит заказ — приходит уведомление:\n"
         "  Написать — AI пишет отклик автору заказа\n"
         "  Пропустить — уведомление закрывается\n\n"
-        "Бот вступает только в группы (где можно писать), "
-        "каналы игнорирует."
+        "Бот вступает только в группы (где можно писать).\n"
+        "После вступления отправляет пробное сообщение — если группа\n"
+        "закрыта для постинга, бот сразу выходит из неё.\n"
+        "Чтобы настроить текст вступительного сообщения — используй /intro"
     )
 
 @dp.message(Command("settings"))
