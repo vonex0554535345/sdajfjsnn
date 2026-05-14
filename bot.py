@@ -36,23 +36,20 @@ MAX_HISTORY    = int(os.environ.get("MAX_HISTORY", "20"))
 BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 DB_PATH        = os.environ.get("DB_PATH", "leads.db")
 
-SCAN_KEYWORDS = [
-    "дизайн заказ",
-    "веб дизайн фриланс",
-    "логотип заказ",
-    "фриланс дизайнер",
-    "заказать баннер",
-    "UI UX заказ",
-    "дизайн лендинг",
-    "дизайн работа",
-    "графический дизайн",
-    "брендинг заказ",
-    "иллюстрация заказ",
-    "презентация заказ",
-    "полиграфия заказ",
-    "Telegram дизайн",
-    "3D визуализация заказ",
+ALL_KEYWORDS = [
+    "дизайн заказ", "веб дизайн фриланс", "логотип заказ", "фриланс дизайнер",
+    "заказать баннер", "UI UX заказ", "дизайн лендинг", "дизайн работа",
+    "графический дизайн", "брендинг заказ", "иллюстрация заказ",
+    "презентация заказ", "полиграфия заказ", "Telegram дизайн",
+    "3D визуализация заказ", "дизайн сайта", "моушн дизайн", "motion design",
+    "SMM дизайн", "дизайн упаковки", "арт заказ", "freelance design",
+    "ищу дизайнера", "найти дизайнера", "заказ дизайнеру", "дизайн удаленно",
+    "дизайн проект", "дизайн чат", "фриланс биржа", "биржа фриланс",
+    "дизайн реклама", "корпоративный дизайн", "дизайн приложения",
+    "иконки заказ", "визитка заказ", "дизайн меню", "дизайн вывески",
+    "анимация заказ", "видеомонтаж заказ", "инфографика заказ",
 ]
+_kw_index = 0
 
 # ── Clients ────────────────────────────────────────────────────────────────────
 groq_client = Groq(api_key=GROQ_API_KEY)
@@ -73,7 +70,7 @@ _cfg: dict[str, str] = {"portfolio_url": "", "intro_text": ""}
 _monitor_chats: set  = set()
 
 _autoscan_task: asyncio.Task | None = None
-_autoscan_hours: int = 1
+_seen_usernames: set[str] = set()  # all chats ever found — never re-scanned
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATABASE
@@ -96,6 +93,10 @@ async def init_db() -> None:
                 chat_id INTEGER PRIMARY KEY,
                 title   TEXT DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS seen_chats (
+                username TEXT PRIMARY KEY,
+                found_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
         """)
         await db.commit()
 
@@ -105,6 +106,14 @@ async def load_settings_from_db() -> None:
             _cfg[row[0]] = row[1]
         async for row in await db.execute("SELECT chat_id FROM monitor_chats"):
             _monitor_chats.add(row[0])
+        async for row in await db.execute("SELECT username FROM seen_chats"):
+            _seen_usernames.add(row[0])
+
+async def db_mark_seen(username: str) -> None:
+    _seen_usernames.add(username)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO seen_chats (username) VALUES (?)", (username,))
+        await db.commit()
 
 async def save_setting(key: str, value: str) -> None:
     _cfg[key] = value
@@ -222,22 +231,27 @@ async def generate_letter(order_text: str) -> str:
 
 async def find_design_chats(keywords: list[str] | None = None, max_per_kw: int = 15) -> list[dict]:
     if keywords is None:
-        keywords = SCAN_KEYWORDS
-    seen: set[int] = set()
+        keywords = ALL_KEYWORDS
+    dedup_ids: set[int] = set()
     found: list[dict] = []
     for kw in keywords:
         try:
             result = await app.invoke(raw_fn.contacts.Search(q=kw, limit=max_per_kw))
             for chat in result.chats:
-                # Skip broadcast channels — only groups and supergroups allow members to post
+                # Only groups and supergroups — skip broadcast channels
                 if isinstance(chat, raw_types.Channel) and not getattr(chat, 'megagroup', False):
                     continue
                 username = getattr(chat, 'username', '') or ''
                 title    = getattr(chat, 'title', '')    or ''
                 members  = getattr(chat, 'participants_count', 0) or 0
-                if not username or not title or chat.id in seen:
+                if not username or not title or chat.id in dedup_ids:
                     continue
-                seen.add(chat.id)
+                dedup_ids.add(chat.id)
+                uname_low = username.lower()
+                # Skip chats ever seen before (even if we left them)
+                if uname_low in _seen_usernames:
+                    continue
+                await db_mark_seen(uname_low)
                 found.append({'username': username, 'title': title, 'members': members})
             await asyncio.sleep(1.5)
         except Exception as e:
@@ -311,19 +325,33 @@ async def join_and_monitor(chats: list[dict], limit: int = 500) -> list[str]:
     return joined
 
 
+_KW_BATCH = 4  # keywords per iteration
+
 async def autoscan_loop() -> None:
+    global _kw_index
+    logger.info("Autoscan started — continuously rotating %d keywords", len(ALL_KEYWORDS))
     while True:
-        logger.info("Autoscan: scanning...")
+        # Take next batch of keywords, wrap around
+        batch = []
+        for i in range(_KW_BATCH):
+            batch.append(ALL_KEYWORDS[(_kw_index + i) % len(ALL_KEYWORDS)])
+        _kw_index = (_kw_index + _KW_BATCH) % len(ALL_KEYWORDS)
+
+        logger.info("Autoscan: trying keywords %s", batch)
         try:
-            chats = await find_design_chats()
-            joined = await join_and_monitor(chats)
-            if joined and ai_bot and me_id:
-                result = "\n".join(f"✅ {t}" for t in joined)
-                await ai_bot.send_message(me_id, f"🔍 Автосканирование завершено.\nВступил в:\n{result}")
+            chats = await find_design_chats(batch)
+            if chats:
+                logger.info("Autoscan: %d new groups found", len(chats))
+                joined = await join_and_monitor(chats)
+                if joined and ai_bot and me_id:
+                    result = "\n".join(f"✅ {t}" for t in joined)
+                    await ai_bot.send_message(me_id, f"🔍 Новые группы добавлены:\n{result}")
+            else:
+                logger.info("Autoscan: no new groups in this batch")
         except Exception as e:
             logger.error("Autoscan loop error: %s", e)
-        logger.info("Autoscan: sleeping %dh", _autoscan_hours)
-        await asyncio.sleep(_autoscan_hours * 3600)
+
+        await asyncio.sleep(60)  # 60s between batches → full cycle ~10 min
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
@@ -338,7 +366,7 @@ async def settings_text() -> str:
     )
     portfolio    = _cfg.get("portfolio_url") or "не задано"
     intro        = _cfg.get("intro_text")    or "не задано"
-    scan_status  = f"каждые {_autoscan_hours}ч" if (_autoscan_task and not _autoscan_task.done()) else "выключен"
+    scan_status  = f"включён (каждые 60с, {len(ALL_KEYWORDS)} ключ. слов, {len(_seen_usernames)} уже просмотрено)" if (_autoscan_task and not _autoscan_task.done()) else "выключен"
     return (
         "Настройки бота\n\n"
         f"Портфолио:\n  {portfolio}\n\n"
@@ -539,11 +567,10 @@ async def cmd_scan(message: BotMessage) -> None:
 
 @dp.message(Command("autoscan"))
 async def cmd_autoscan(message: BotMessage) -> None:
-    global _autoscan_task, _autoscan_hours
+    global _autoscan_task
     text = (message.text or "")[9:].strip()
-    parts = text.split()
 
-    if parts and parts[0] == "off":
+    if text == "off":
         if _autoscan_task and not _autoscan_task.done():
             _autoscan_task.cancel()
             _autoscan_task = None
@@ -552,30 +579,23 @@ async def cmd_autoscan(message: BotMessage) -> None:
             await message.answer("Автосканирование уже выключено.")
         return
 
-    if parts and parts[0] == "on":
-        if len(parts) > 1:
-            try:
-                _autoscan_hours = max(1, int(parts[1]))
-            except ValueError:
-                pass
+    if text == "on":
         if _autoscan_task and not _autoscan_task.done():
-            await message.answer(
-                f"Автосканирование уже запущено (каждые {_autoscan_hours}ч).\n"
-                "Чтобы перезапустить с другим интервалом — сначала /autoscan off"
-            )
+            await message.answer("Автосканирование уже запущено.")
             return
         _autoscan_task = asyncio.create_task(autoscan_loop())
         await message.answer(
-            f"Автосканирование включено.\n"
-            f"Каждые {_autoscan_hours}ч ищу все новые дизайн-чаты и вступаю в них без ограничений."
+            "Автосканирование включено.\n\n"
+            f"Каждые 60 сек беру очередные {_KW_BATCH} ключевых слова из {len(ALL_KEYWORDS)}, "
+            "ищу только НОВЫЕ группы (уже найденные навсегда пропускаются), "
+            "вступаю и мониторю. Полный цикл по всем словам — ~10 мин."
         )
         return
 
-    status = f"включено (каждые {_autoscan_hours}ч)" if (_autoscan_task and not _autoscan_task.done()) else "выключено"
+    status = "включено" if (_autoscan_task and not _autoscan_task.done()) else "выключено"
     await message.answer(
         f"Автосканирование: {status}\n\n"
-        "/autoscan on — включить (каждые 1ч)\n"
-        "/autoscan on 2 — включить (каждые 2ч)\n"
+        "/autoscan on — включить\n"
         "/autoscan off — выключить"
     )
 
