@@ -7,9 +7,18 @@ import re
 import aiosqlite
 
 from pyrogram import Client, filters, idle
-from pyrogram.types import (
-    Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from pyrogram.types import Message
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import (
+    Message as BotMessage,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    LinkPreviewOptions,
 )
+from aiogram.filters import Command
+
 from groq import Groq
 
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
@@ -28,8 +37,10 @@ DB_PATH        = os.environ.get("DB_PATH", "leads.db")
 
 # ── Clients ────────────────────────────────────────────────────────────────────
 groq_client = Groq(api_key=GROQ_API_KEY)
-app         = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
-notify_bot  = Client("notifybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN) if BOT_TOKEN else None
+app = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
+
+ai_bot: Bot | None = Bot(token=BOT_TOKEN) if BOT_TOKEN else None
+dp = Dispatcher()
 
 # ── Runtime state ──────────────────────────────────────────────────────────────
 histories:      dict[int, list[dict]] = {}
@@ -233,14 +244,16 @@ async def send_order_notification(message: Message) -> None:
         f"Автор: {s_mention}\n\n"
         f"Сообщение:\n{message.text or message.caption or ''}"
     )
-    markup = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Написать",   callback_data=f"write_{token}"),
-        InlineKeyboardButton("❌ Пропустить", callback_data=f"skip_{token}"),
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Написать",   callback_data=f"write_{token}"),
+        InlineKeyboardButton(text="❌ Пропустить", callback_data=f"skip_{token}"),
     ]])
 
-    if notify_bot and me_id:
-        await notify_bot.send_message(
-            me_id, notification, reply_markup=markup, disable_web_page_preview=True
+    if ai_bot and me_id:
+        await ai_bot.send_message(
+            me_id, notification, reply_markup=keyboard,
+            parse_mode="Markdown",
+            link_preview_options=LinkPreviewOptions(is_disabled=True),
         )
     else:
         await app.send_message(
@@ -270,169 +283,154 @@ async def handle_monitored(_: Client, message: Message) -> None:
         await send_order_notification(message)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  NOTIFY BOT — команды управления (всё через бота напрямую)
+#  AIOGRAM BOT — команды управления
 # ══════════════════════════════════════════════════════════════════════════════
 
-if notify_bot:
-    @notify_bot.on_message()
-    async def handle_bot_message(client: Client, message: Message) -> None:
-        logger.info("BOT MSG from=%s text=%r",
-                    message.from_user.id if message.from_user else "?",
-                    (message.text or "")[:60])
+@dp.message(Command("start"))
+async def cmd_start(message: BotMessage) -> None:
+    await message.answer(
+        "Привет! Я бот-охотник за заказами.\n\n"
+        "Мониторю фриланс-чаты, фильтрую заказы через AI "
+        "и уведомляю тебя с кнопками Написать / Пропустить.\n\n"
+        "Команды:\n"
+        "/settings — текущие настройки\n"
+        "/portfolio — задать портфолио\n"
+        "/intro — текст о себе для откликов\n"
+        "/add — добавить чат в мониторинг\n"
+        "/remove — убрать чат из мониторинга"
+    )
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: BotMessage) -> None:
+    await message.answer(await settings_text())
+
+@dp.message(Command("portfolio"))
+async def cmd_portfolio(message: BotMessage) -> None:
+    text = message.text or ""
+    url = text[10:].strip()
+    if not url:
+        cur = _cfg.get("portfolio_url") or "не задано"
+        await message.answer(
+            f"Текущее портфолио: {cur}\n\n"
+            "Чтобы задать, напиши:\n"
+            "/portfolio https://behance.net/yourname"
+        )
+        return
+    await save_setting("portfolio_url", url)
+    await message.answer(f"Портфолио сохранено:\n{url}")
+
+@dp.message(Command("intro"))
+async def cmd_intro(message: BotMessage) -> None:
+    text = message.text or ""
+    intro = text[6:].strip()
+    if not intro:
+        cur = _cfg.get("intro_text") or "не задано"
+        await message.answer(
+            f"Текущий текст о себе: {cur}\n\n"
+            "AI вставляет его в каждый отклик.\n"
+            "Чтобы задать, напиши:\n"
+            "/intro Я дизайнер с 5 лет опытом, специализируюсь на веб-дизайне и брендинге"
+        )
+        return
+    await save_setting("intro_text", intro)
+    await message.answer(f"Текст о себе сохранён:\n{intro}")
+
+@dp.message(Command("add"))
+async def cmd_add(message: BotMessage) -> None:
+    text = message.text or ""
+    arg = text[4:].strip()
+    if not arg:
+        await message.answer(
+            "Укажи ID или username чата:\n"
+            "/add -1001234567890\n"
+            "/add @freelance_ru"
+        )
+        return
+    try:
+        chat_id = int(arg)
+        title = str(chat_id)
         try:
-            text = (message.text or "").strip()
-
-            # /start
-            if text == "/start":
-                await message.reply(
-                    "Привет! Я бот-охотник за заказами.\n\n"
-                    "Мониторю фриланс-чаты, фильтрую заказы через AI "
-                    "и уведомляю тебя с кнопками Написать / Пропустить.\n\n"
-                    "Команды:\n"
-                    "/settings — текущие настройки\n"
-                    "/portfolio — задать портфолио\n"
-                    "/intro — текст о себе для откликов\n"
-                    "/add — добавить чат в мониторинг\n"
-                    "/remove — убрать чат из мониторинга"
-                )
-                return
-
-            # /settings
-            if text.startswith("/settings"):
-                await message.reply(await settings_text())
-                return
-
-            # /portfolio
-            if text.startswith("/portfolio"):
-                url = text[10:].strip()
-                if not url:
-                    cur = _cfg.get("portfolio_url") or "не задано"
-                    await message.reply(
-                        f"Текущее портфолио: {cur}\n\n"
-                        "Чтобы задать, напиши:\n"
-                        "/portfolio https://behance.net/yourname"
-                    )
-                    return
-                await save_setting("portfolio_url", url)
-                await message.reply(f"Портфолио сохранено:\n{url}")
-                return
-
-            # /intro
-            if text.startswith("/intro"):
-                intro = text[6:].strip()
-                if not intro:
-                    cur = _cfg.get("intro_text") or "не задано"
-                    await message.reply(
-                        f"Текущий текст о себе: {cur}\n\n"
-                        "AI вставляет его в каждый отклик.\n"
-                        "Чтобы задать, напиши:\n"
-                        "/intro Я дизайнер с 5 лет опытом, специализируюсь на веб-дизайне и брендинге"
-                    )
-                    return
-                await save_setting("intro_text", intro)
-                await message.reply(f"Текст о себе сохранён:\n{intro}")
-                return
-
-            # /add
-            if text.startswith("/add"):
-                arg = text[4:].strip()
-                if not arg:
-                    await message.reply(
-                        "Укажи ID или username чата:\n"
-                        "/add -1001234567890\n"
-                        "/add @freelance_ru"
-                    )
-                    return
-                try:
-                    chat_id = int(arg)
-                    title = str(chat_id)
-                    try:
-                        chat_obj = await app.get_chat(chat_id)
-                        title = chat_obj.title or chat_obj.username or str(chat_id)
-                    except Exception:
-                        pass
-                    await db_add_monitor_chat(chat_id, title)
-                    await message.reply(f"Чат добавлен в мониторинг:\n{title}\nID: {chat_id}")
-                except ValueError:
-                    username = arg.lstrip("@")
-                    try:
-                        chat_obj = await app.get_chat(username)
-                        chat_id  = chat_obj.id
-                        title    = chat_obj.title or chat_obj.username or username
-                        await db_add_monitor_chat(chat_id, title)
-                        await message.reply(f"Чат добавлен в мониторинг:\n{title}\nID: {chat_id}")
-                    except Exception as e:
-                        await message.reply(f"Чат не найден: @{username}\nОшибка: {e}")
-                return
-
-            # /remove
-            if text.startswith("/remove"):
-                arg = text[7:].strip()
-                if not arg:
-                    chats = await db_get_monitor_chats()
-                    if not chats:
-                        await message.reply("Список мониторинга пуст.")
-                        return
-                    chats_str = "\n".join(f"/remove {c_id}  ({title or c_id})" for c_id, title in chats)
-                    await message.reply(f"Какой чат убрать?\n\n{chats_str}")
-                    return
-                try:
-                    chat_id = int(arg)
-                except ValueError:
-                    username = arg.lstrip("@")
-                    try:
-                        chat_obj = await app.get_chat(username)
-                        chat_id  = chat_obj.id
-                    except Exception as e:
-                        await message.reply(f"Чат не найден: {e}")
-                        return
-                await db_remove_monitor_chat(chat_id)
-                await message.reply(f"Чат {chat_id} удалён из мониторинга.")
-                return
-
-            # Неизвестная команда
-            await message.reply(
-                "Не понял команду.\n\n"
-                "/settings — настройки\n"
-                "/add — добавить чат\n"
-                "/remove — убрать чат\n"
-                "/portfolio — портфолио\n"
-                "/intro — текст о себе"
-            )
-
+            chat_obj = await app.get_chat(chat_id)
+            title = chat_obj.title or chat_obj.username or str(chat_id)
+        except Exception:
+            pass
+        await db_add_monitor_chat(chat_id, title)
+        await message.answer(f"Чат добавлен в мониторинг:\n{title}\nID: {chat_id}")
+    except ValueError:
+        username = arg.lstrip("@")
+        try:
+            chat_obj = await app.get_chat(username)
+            chat_id  = chat_obj.id
+            title    = chat_obj.title or chat_obj.username or username
+            await db_add_monitor_chat(chat_id, title)
+            await message.answer(f"Чат добавлен в мониторинг:\n{title}\nID: {chat_id}")
         except Exception as e:
-            logger.error("handle_bot_message crash: %s", e, exc_info=True)
-            await message.reply(f"Ошибка: {e}")
+            await message.answer(f"Чат не найден: @{username}\nОшибка: {e}")
 
-    @notify_bot.on_callback_query()
-    async def handle_callback(_: Client, cb: CallbackQuery) -> None:
-        data = cb.data or ""
+@dp.message(Command("remove"))
+async def cmd_remove(message: BotMessage) -> None:
+    text = message.text or ""
+    arg = text[7:].strip()
+    if not arg:
+        chats = await db_get_monitor_chats()
+        if not chats:
+            await message.answer("Список мониторинга пуст.")
+            return
+        chats_str = "\n".join(f"/remove {c_id}  ({title or c_id})" for c_id, title in chats)
+        await message.answer(f"Какой чат убрать?\n\n{chats_str}")
+        return
+    try:
+        chat_id = int(arg)
+    except ValueError:
+        username = arg.lstrip("@")
+        try:
+            chat_obj = await app.get_chat(username)
+            chat_id  = chat_obj.id
+        except Exception as e:
+            await message.answer(f"Чат не найден: {e}")
+            return
+    await db_remove_monitor_chat(chat_id)
+    await message.answer(f"Чат {chat_id} удалён из мониторинга.")
 
-        if data.startswith("skip_"):
-            pending_orders.pop(data[5:], None)
-            await cb.message.edit_text("Пропущено.")
-            await cb.answer()
+@dp.message()
+async def cmd_unknown(message: BotMessage) -> None:
+    await message.answer(
+        "Не понял команду.\n\n"
+        "/settings — настройки\n"
+        "/add — добавить чат\n"
+        "/remove — убрать чат\n"
+        "/portfolio — портфолио\n"
+        "/intro — текст о себе"
+    )
 
-        elif data.startswith("write_"):
-            token = data[6:]
-            order = pending_orders.get(token)
-            if not order:
-                await cb.answer("Заказ уже обработан или устарел.", show_alert=True)
-                return
-            await cb.message.edit_text("Генерирую отклик...")
-            await cb.answer()
-            try:
-                letter = await generate_letter(order["text"])
-                await asyncio.sleep(random.uniform(3, 7))
-                if order["sender_id"]:
-                    await app.send_message(order["sender_id"], letter)
-                    pending_orders.pop(token, None)
-                    await cb.message.edit_text(f"Отклик отправлен!\n\n{letter}")
-                else:
-                    await cb.message.edit_text("Не удалось определить автора заказа.")
-            except Exception as e:
-                logger.error("Letter send error: %s", e)
-                await cb.message.edit_text(f"Ошибка отправки: {e}")
+@dp.callback_query(F.data.startswith("skip_"))
+async def cb_skip(callback: CallbackQuery) -> None:
+    token = (callback.data or "")[5:]
+    pending_orders.pop(token, None)
+    await callback.message.edit_text("Пропущено.")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("write_"))
+async def cb_write(callback: CallbackQuery) -> None:
+    token = (callback.data or "")[6:]
+    order = pending_orders.get(token)
+    if not order:
+        await callback.answer("Заказ уже обработан или устарел.", show_alert=True)
+        return
+    await callback.message.edit_text("Генерирую отклик...")
+    await callback.answer()
+    try:
+        letter = await generate_letter(order["text"])
+        await asyncio.sleep(random.uniform(3, 7))
+        if order["sender_id"]:
+            await app.send_message(order["sender_id"], letter)
+            pending_orders.pop(token, None)
+            await callback.message.edit_text(f"Отклик отправлен!\n\n{letter}")
+        else:
+            await callback.message.edit_text("Не удалось определить автора заказа.")
+    except Exception as e:
+        logger.error("Letter send error: %s", e)
+        await callback.message.edit_text(f"Ошибка отправки: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  EXISTING: диалоги и execute_task
@@ -534,7 +532,7 @@ async def execute_task(client: Client, task: str) -> str:
     return "\n".join(results) if results else (msg.content or "Задача не распознана")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  USERBOT: «Избранное» — задачи (оставляем для AI-агента)
+#  USERBOT: «Избранное» — задачи
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.on_message(filters.me & filters.private)
@@ -572,7 +570,6 @@ async def handle_saved_message(client: Client, message: Message) -> None:
         if text.startswith("/"):
             return
 
-        # Свободный текст — выполнить как задачу AI-агента
         await client.send_message("me", "Выполняю задачу...")
         try:
             result = await execute_task(client, text)
@@ -628,16 +625,18 @@ async def main() -> None:
         me_id = (await app.get_me()).id
         logger.info("Userbot started (me_id=%s)", me_id)
 
-        if notify_bot:
-            async with notify_bot:
-                bot_info = await notify_bot.get_me()
-                logger.info("Notify-bot started: @%s (id=%s)", bot_info.username, bot_info.id)
-                try:
-                    await notify_bot.send_message(me_id, f"Бот @{bot_info.username} запущен! Напиши /start")
-                    logger.info("Startup message sent to owner")
-                except Exception as e:
-                    logger.error("Cannot message owner (did you /start the bot?): %s", e)
-                await idle()
+        if ai_bot:
+            bot_info = await ai_bot.get_me()
+            logger.info("Notify-bot started: @%s (id=%s)", bot_info.username, bot_info.id)
+            try:
+                await ai_bot.send_message(me_id, f"Бот @{bot_info.username} запущен! Напиши /start")
+                logger.info("Startup message sent to owner")
+            except Exception as e:
+                logger.error("Cannot message owner: %s", e)
+            await asyncio.gather(
+                idle(),
+                dp.start_polling(ai_bot, handle_signals=False),
+            )
         else:
             logger.warning("No TELEGRAM_BOT_TOKEN set.")
             await idle()
