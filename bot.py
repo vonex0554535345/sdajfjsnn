@@ -8,7 +8,7 @@ import aiosqlite
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
-from pyrogram.raw import functions as raw_fn
+from pyrogram.raw import functions as raw_fn, types as raw_types
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -229,6 +229,9 @@ async def find_design_chats(keywords: list[str] | None = None, max_per_kw: int =
         try:
             result = await app.invoke(raw_fn.contacts.Search(q=kw, limit=max_per_kw))
             for chat in result.chats:
+                # Skip broadcast channels — only groups and supergroups allow members to post
+                if isinstance(chat, raw_types.Channel) and not getattr(chat, 'megagroup', False):
+                    continue
                 username = getattr(chat, 'username', '') or ''
                 title    = getattr(chat, 'title', '')    or ''
                 members  = getattr(chat, 'participants_count', 0) or 0
@@ -376,17 +379,41 @@ async def handle_monitored(_: Client, message: Message) -> None:
 @dp.message(Command("start"))
 async def cmd_start(message: BotMessage) -> None:
     await message.answer(
-        "Привет! Я бот-охотник за заказами.\n\n"
-        "Мониторю фриланс-чаты, фильтрую заказы через AI "
-        "и уведомляю тебя с кнопками Написать / Пропустить.\n\n"
-        "Команды:\n"
-        "/settings — текущие настройки\n"
-        "/portfolio — задать портфолио\n"
-        "/intro — текст о себе для откликов\n"
-        "/scan — найти популярные дизайн-чаты и вступить\n"
-        "/autoscan — автопоиск чатов по расписанию\n"
-        "/add — добавить чат вручную\n"
-        "/remove — убрать чат из мониторинга"
+        "Привет! Я бот-охотник за заказами на дизайн.\n\n"
+        "Вступаю в фриланс-группы, слежу за сообщениями, "
+        "фильтрую заказы через AI и уведомляю тебя.\n\n"
+        "Быстрый старт:\n"
+        "1. /scan — найти и вступить в дизайн-группы\n"
+        "2. /autoscan on — включить поиск каждый час\n"
+        "3. /portfolio — задать ссылку на портфолио\n\n"
+        "/help — полная справка по всем командам"
+    )
+
+@dp.message(Command("help"))
+async def cmd_help(message: BotMessage) -> None:
+    await message.answer(
+        "Справка по командам\n\n"
+        "ПОИСК ГРУПП\n"
+        "/scan — найти дизайн-группы и вступить во все\n"
+        "/scan слово1, слово2 — поиск по своим ключевым словам\n"
+        "/autoscan on — автопоиск каждый час\n"
+        "/autoscan on 2 — автопоиск каждые 2 часа\n"
+        "/autoscan off — остановить автопоиск\n\n"
+        "УПРАВЛЕНИЕ ЧАТАМИ\n"
+        "/add @username — добавить группу по username\n"
+        "/add -1001234567 — добавить группу по ID\n"
+        "/remove — показать список для удаления\n"
+        "/settings — все текущие настройки\n\n"
+        "НАСТРОЙКА ОТКЛИКОВ\n"
+        "/portfolio https://... — ссылка на портфолио\n"
+        "/intro текст — текст о себе для AI\n\n"
+        "КАК РАБОТАЕТ\n"
+        "Бот следит за сообщениями в добавленных группах.\n"
+        "Когда AI находит заказ — приходит уведомление:\n"
+        "  Написать — AI пишет отклик автору заказа\n"
+        "  Пропустить — уведомление закрывается\n\n"
+        "Бот вступает только в группы (где можно писать), "
+        "каналы игнорирует."
     )
 
 @dp.message(Command("settings"))
@@ -447,8 +474,8 @@ async def cmd_scan(message: BotMessage) -> None:
         for i, c in enumerate(top)
     )
     await message.answer(
-        f"Найдено {len(chats)} чатов. Топ {len(top)}:\n\n{lines}\n\n"
-        "Вступаю в первые 5 и добавляю в мониторинг..."
+        f"Найдено {len(chats)} групп. Топ {len(top)} по размеру:\n\n{lines}\n\n"
+        f"Вступаю во все {len(chats)} и добавляю в мониторинг..."
     )
 
     joined = await join_and_monitor(chats)
@@ -563,16 +590,7 @@ async def cmd_remove(message: BotMessage) -> None:
 
 @dp.message()
 async def cmd_unknown(message: BotMessage) -> None:
-    await message.answer(
-        "Не понял команду.\n\n"
-        "/settings — настройки\n"
-        "/scan — автопоиск дизайн-чатов\n"
-        "/autoscan — поиск по расписанию\n"
-        "/add — добавить чат вручную\n"
-        "/remove — убрать чат\n"
-        "/portfolio — портфолио\n"
-        "/intro — текст о себе"
-    )
+    await message.answer("Не понял команду. Напиши /help — список всех команд.")
 
 @dp.callback_query(F.data.startswith("skip_"))
 async def cb_skip(callback: CallbackQuery) -> None:
