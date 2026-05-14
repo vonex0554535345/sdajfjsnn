@@ -17,7 +17,7 @@ from groq import Groq
 logging.basicConfig(format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ── Config ─────────────────────────────────────────────────────────────────────
+# ── Config (только обязательные — остальное через /settings) ───────────────────
 API_ID         = int(os.environ["TELEGRAM_API_ID"])
 API_HASH       = os.environ["TELEGRAM_API_HASH"]
 SESSION_STRING = os.environ["TELEGRAM_SESSION"]
@@ -25,37 +25,29 @@ GROQ_API_KEY   = os.environ["GROQ_API_KEY"]
 SYSTEM_PROMPT  = os.environ.get("SYSTEM_PROMPT", "Ты helpful ассистент. Отвечай коротко на русском.")
 MODEL          = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 MAX_HISTORY    = int(os.environ.get("MAX_HISTORY", "20"))
-
-# Lead-hunter config
-BOT_TOKEN     = os.environ.get("TELEGRAM_BOT_TOKEN", "")   # from @BotFather
-PORTFOLIO_URL = os.environ.get("PORTFOLIO_URL", "")         # ссылка на портфолио
-DB_PATH       = os.environ.get("DB_PATH", "leads.db")
-
-# Список чатов для мониторинга: "id1,id2,@username1,..."
-_raw_chats = os.environ.get("MONITOR_CHATS", "")
-MONITOR_CHATS: list = []
-for _c in _raw_chats.split(","):
-    _c = _c.strip()
-    if _c:
-        try:
-            MONITOR_CHATS.append(int(_c))
-        except ValueError:
-            MONITOR_CHATS.append(_c)
+BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+DB_PATH        = os.environ.get("DB_PATH", "leads.db")
 
 # ── Clients ────────────────────────────────────────────────────────────────────
 groq_client = Groq(api_key=GROQ_API_KEY)
-app = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
-# Бот нужен для инлайн-кнопок — userbot не может обрабатывать callback_query
-notify_bot = Client("notifybot", bot_token=BOT_TOKEN) if BOT_TOKEN else None
+app         = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
+notify_bot  = Client("notifybot", bot_token=BOT_TOKEN) if BOT_TOKEN else None
 
-# ── State ──────────────────────────────────────────────────────────────────────
-histories: dict[int, list[dict]] = {}
-is_active = True
-blocked_users: set[str] = set()
-me_id: int | None = None
-dialogs_cache: list[dict] = []
-# Хранит данные ожидающих заказов до нажатия кнопки
-pending_orders: dict[str, dict] = {}
+# ── Runtime state ──────────────────────────────────────────────────────────────
+histories:      dict[int, list[dict]] = {}
+is_active       = True
+blocked_users:  set[str]              = set()
+me_id:          int | None            = None
+dialogs_cache:  list[dict]            = []
+pending_orders: dict[str, dict]       = {}
+
+# Настройки, живут в памяти (загружаются из БД при старте)
+_cfg: dict[str, str] = {
+    "portfolio_url": "",
+    "intro_text":    "",
+}
+# Множество чатов для мониторинга (int id или str @username без @)
+_monitor_chats: set = set()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATABASE
@@ -63,15 +55,58 @@ pending_orders: dict[str, dict] = {}
 
 async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
+        await db.executescript("""
             CREATE TABLE IF NOT EXISTS processed_posts (
                 chat_id    INTEGER NOT NULL,
                 message_id INTEGER NOT NULL,
-                created_at TEXT    DEFAULT CURRENT_TIMESTAMP,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (chat_id, message_id)
-            )
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS monitor_chats (
+                chat_id INTEGER PRIMARY KEY,
+                title   TEXT DEFAULT ''
+            );
         """)
         await db.commit()
+
+async def load_settings_from_db() -> None:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async for row in await db.execute("SELECT key, value FROM settings"):
+            _cfg[row[0]] = row[1]
+        async for row in await db.execute("SELECT chat_id FROM monitor_chats"):
+            _monitor_chats.add(row[0])
+
+async def save_setting(key: str, value: str) -> None:
+    _cfg[key] = value
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value)
+        )
+        await db.commit()
+
+async def db_add_monitor_chat(chat_id: int, title: str = "") -> None:
+    _monitor_chats.add(chat_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO monitor_chats (chat_id, title) VALUES (?, ?)",
+            (chat_id, title)
+        )
+        await db.commit()
+
+async def db_remove_monitor_chat(chat_id: int) -> None:
+    _monitor_chats.discard(chat_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM monitor_chats WHERE chat_id=?", (chat_id,))
+        await db.commit()
+
+async def db_get_monitor_chats() -> list[tuple[int, str]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT chat_id, title FROM monitor_chats ORDER BY chat_id")
+        return await cur.fetchall()
 
 async def is_processed(chat_id: int, message_id: int) -> bool:
     async with aiosqlite.connect(DB_PATH) as db:
@@ -144,17 +179,23 @@ async def classify_order(text: str) -> tuple[bool, str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def generate_letter(order_text: str) -> str:
-    portfolio_line = f"\n\nПортфолио: {PORTFOLIO_URL}" if PORTFOLIO_URL else ""
+    portfolio = _cfg.get("portfolio_url", "")
+    intro     = _cfg.get("intro_text", "")
+
+    intro_block     = f"\nО себе: {intro}" if intro else ""
+    portfolio_block = f"\n\nПортфолио: {portfolio}" if portfolio else ""
+
     prompt = f"""\
 Напиши короткий отклик на фриланс-заказ от лица дизайнера. Требования:
 — 3–5 предложений, конкретно и без воды
-— Вежливый тон, покажи понимание задачи
+— Вежливый и уверенный тон, покажи понимание задачи
 — Предложи обсудить детали и сроки
-— НЕ начинай с "Здравствуйте, меня зовут..."
-— Язык: русский{portfolio_line}
+— НЕ начинай с "Здравствуйте, меня зовут..."{intro_block}
+— Язык: русский{portfolio_block}
 
 Заказ клиента:
 {order_text[:1000]}"""
+
     resp = await asyncio.to_thread(
         groq_client.chat.completions.create,
         model=MODEL,
@@ -197,53 +238,41 @@ async def send_order_notification(message: Message) -> None:
 
     if notify_bot:
         await notify_bot.send_message(
-            me_id,
-            notification,
-            reply_markup=markup,
-            disable_web_page_preview=True,
+            me_id, notification, reply_markup=markup, disable_web_page_preview=True
         )
     else:
-        # Режим без бота: шлём в «Избранное» текстом (без инлайн-кнопок)
         await app.send_message(
             "me",
-            notification + (
-                f"\n\n💡 Нет `TELEGRAM_BOT_TOKEN` — кнопки недоступны.\n"
-                f"Чтобы ответить, отправь: `/write {token}`\n"
-                f"Чтобы пропустить: `/skip {token}`"
-            ),
+            notification + f"\n\n`/write {token}` — написать\n`/skip {token}` — пропустить",
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LEAD-HUNTER: MONITOR HANDLER (userbot слушает чаты)
+#  LEAD-HUNTER: MONITOR HANDLER
+#  Динамический фильтр — проверяет _monitor_chats в момент получения сообщения
 # ══════════════════════════════════════════════════════════════════════════════
 
-_monitor_filter = (
-    filters.chat(MONITOR_CHATS) & filters.incoming & ~filters.me
-    if MONITOR_CHATS
-    else filters.create(lambda _, __, ___: False)
-)
+def _is_monitored(_, __, message: Message) -> bool:
+    if not _monitor_chats:
+        return False
+    return message.chat.id in _monitor_chats
 
-@app.on_message(_monitor_filter)
+@app.on_message(filters.create(_is_monitored) & filters.incoming & ~filters.me)
 async def handle_monitored(_: Client, message: Message) -> None:
     text = message.text or message.caption
     if not text or len(text) < 20:
         return
-
     if await is_processed(message.chat.id, message.id):
         return
     await mark_processed(message.chat.id, message.id)
 
     is_order, reason = await classify_order(text)
-    logger.info(
-        "[monitor] chat=%s msg=%s → is_order=%s | %s",
-        message.chat.id, message.id, is_order, reason,
-    )
-
+    logger.info("[monitor] chat=%s msg=%s → is_order=%s | %s",
+                message.chat.id, message.id, is_order, reason)
     if is_order:
         await send_order_notification(message)
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LEAD-HUNTER: CALLBACK HANDLER (notify_bot обрабатывает нажатия кнопок)
+#  LEAD-HUNTER: CALLBACK HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
 
 if notify_bot:
@@ -252,39 +281,30 @@ if notify_bot:
         data = cb.data or ""
 
         if data.startswith("skip_"):
-            token = data[5:]
-            pending_orders.pop(token, None)
+            pending_orders.pop(data[5:], None)
             await cb.message.edit_text("❌ Пропущено.", reply_markup=None)
             await cb.answer()
 
         elif data.startswith("write_"):
             token = data[6:]
             order = pending_orders.get(token)
-
             if not order:
                 await cb.answer("Заказ уже обработан или устарел.", show_alert=True)
                 return
 
             await cb.message.edit_text("⏳ Генерирую отклик...", reply_markup=None)
             await cb.answer()
-
             try:
                 letter = await generate_letter(order["text"])
-                # Антифлуд-задержка
                 await asyncio.sleep(random.uniform(3, 7))
-
                 if order["sender_id"]:
                     await app.send_message(order["sender_id"], letter)
                     pending_orders.pop(token, None)
                     await cb.message.edit_text(
-                        f"✅ Отклик отправлен!\n\n**Текст:**\n{letter}",
-                        reply_markup=None,
+                        f"✅ Отклик отправлен!\n\n**Текст:**\n{letter}", reply_markup=None
                     )
                 else:
-                    await cb.message.edit_text(
-                        "❌ Не удалось определить автора заказа.",
-                        reply_markup=None,
-                    )
+                    await cb.message.edit_text("❌ Не удалось определить автора заказа.", reply_markup=None)
             except Exception as e:
                 logger.error("Letter send error: %s", e)
                 await cb.message.edit_text(f"❌ Ошибка отправки: {e}", reply_markup=None)
@@ -303,8 +323,7 @@ async def load_dialogs(client: Client) -> list[dict]:
             seen.add(chat_id)
             dialogs_cache.append({"id": chat_id, "name": name, "username": username or ""})
 
-    contacts = await client.get_contacts()
-    for u in contacts:
+    for u in await client.get_contacts():
         name = f"{u.first_name or ''} {u.last_name or ''}".strip() or u.username or str(u.id)
         add(u.id, name, u.username)
 
@@ -313,8 +332,7 @@ async def load_dialogs(client: Client) -> list[dict]:
         name = (
             chat.title
             or f"{chat.first_name or ''} {chat.last_name or ''}".strip()
-            or chat.username
-            or str(chat.id)
+            or chat.username or str(chat.id)
         )
         add(chat.id, name, chat.username)
 
@@ -323,18 +341,15 @@ async def load_dialogs(client: Client) -> list[dict]:
 
 def find_chat(name: str, dialogs: list[dict]) -> dict | None:
     clean = re.sub(r"\s*\(@[^)]*\)", "", name).strip().lower()
-    username_match = re.search(r"@([\w]+)", name)
-    extracted_username = username_match.group(1).lower() if username_match else ""
-
+    um = re.search(r"@([\w]+)", name)
+    eu = um.group(1).lower() if um else ""
     for d in dialogs:
-        d_name = d["name"].lower()
-        d_user = d["username"].lower()
-        if clean == d_name or (extracted_username and extracted_username == d_user):
+        dn, du = d["name"].lower(), d["username"].lower()
+        if clean == dn or (eu and eu == du):
             return d
     for d in dialogs:
-        d_name = d["name"].lower()
-        d_user = d["username"].lower()
-        if clean in d_name or d_name in clean or (extracted_username and extracted_username in d_user):
+        dn, du = d["name"].lower(), d["username"].lower()
+        if clean in dn or dn in clean or (eu and eu in du):
             return d
     return None
 
@@ -345,7 +360,6 @@ async def execute_task(client: Client, task: str) -> str:
         f"{d['name']} (@{d['username']})" if d["username"] else d["name"]
         for d in dialogs
     ]
-
     tools = [{
         "type": "function",
         "function": {
@@ -354,66 +368,45 @@ async def execute_task(client: Client, task: str) -> str:
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "chat_name": {"type": "string", "description": "Имя контакта или чата"},
-                    "text":      {"type": "string", "description": "Текст сообщения"},
+                    "chat_name": {"type": "string"},
+                    "text":      {"type": "string"},
                 },
                 "required": ["chat_name", "text"],
             },
         },
     }]
-
     system = (
-        f"Ты агент-помощник в Telegram. Выполняй задачи пользователя: "
-        f"пиши сообщения нужным людям, задавай вопросы в чатах.\n"
-        f"Доступные контакты и чаты:\n"
-        f"{chr(10).join(dialog_list[:100])}\n\n"
-        f"Используй инструмент send_message для отправки. "
-        f"Составляй сообщения естественно от лица пользователя."
+        "Ты агент-помощник в Telegram. Выполняй задачи пользователя.\n"
+        f"Доступные контакты и чаты:\n{chr(10).join(dialog_list[:100])}\n\n"
+        "Используй send_message. Пиши естественно от лица пользователя."
     )
-
     response = await asyncio.to_thread(
         groq_client.chat.completions.create,
         model=MODEL,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": task},
-        ],
-        tools=tools,
-        tool_choice="auto",
-        max_tokens=1024,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": task}],
+        tools=tools, tool_choice="auto", max_tokens=1024,
     )
-
     msg = response.choices[0].message
     results = []
-
     if msg.tool_calls:
-        for tool_call in msg.tool_calls:
-            if tool_call.function.name == "send_message":
-                args = json.loads(tool_call.function.arguments)
-                chat_name    = args["chat_name"].strip()
-                text_to_send = args["text"]
-                logger.info("Tool call: send_message to '%s'", chat_name)
+        for tc in msg.tool_calls:
+            if tc.function.name == "send_message":
+                args = json.loads(tc.function.arguments)
+                chat_name, text_to_send = args["chat_name"].strip(), args["text"]
                 try:
-                    if "@" in chat_name:
-                        target = chat_name.lstrip("@")
-                    else:
-                        found = find_chat(chat_name, dialogs)
-                        if not found:
-                            results.append(f"❌ Контакт не найден: {chat_name}")
-                            continue
-                        target = found["id"]
+                    target = chat_name.lstrip("@") if "@" in chat_name else (
+                        (found := find_chat(chat_name, dialogs)) and found["id"]
+                    )
+                    if not target:
+                        results.append(f"❌ Контакт не найден: {chat_name}"); continue
                     await client.send_message(target, text_to_send)
                     results.append(f"✅ Написал {chat_name}: «{text_to_send}»")
                 except Exception as e:
-                    logger.error("Send error: %s", e)
                     results.append(f"❌ Ошибка отправки {chat_name}: {e}")
-
-    if results:
-        return "\n".join(results)
-    return msg.content or "Задача не распознана"
+    return "\n".join(results) if results else (msg.content or "Задача не распознана")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  EXISTING: «Избранное» — команды и задачи
+#  «ИЗБРАННОЕ» — ВСЕ КОМАНДЫ
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.on_message(filters.me & filters.private)
@@ -426,9 +419,110 @@ async def handle_saved_message(client: Client, message: Message) -> None:
 
     text = message.text.strip()
 
-    # ── /on и /off ──
+    # ── /portfolio <url> ───────────────────────────────────────────────────────
+    if text.startswith("/portfolio"):
+        url = text[10:].strip()
+        if not url:
+            cur = _cfg.get("portfolio_url", "не задано")
+            await client.send_message("me", f"📎 Портфолио: {cur}\n\nЧтобы изменить:\n`/portfolio https://...`")
+            return
+        await save_setting("portfolio_url", url)
+        await client.send_message("me", f"✅ Портфолио сохранено:\n{url}")
+        return
+
+    # ── /intro <текст о себе> ──────────────────────────────────────────────────
+    if text.startswith("/intro"):
+        intro = text[6:].strip()
+        if not intro:
+            cur = _cfg.get("intro_text", "не задано")
+            await client.send_message(
+                "me",
+                f"✍️ Текст о себе: {cur}\n\n"
+                "AI использует его при генерации откликов.\n"
+                "Чтобы изменить:\n`/intro Я дизайнер с 5 лет опытом, специализируюсь на...`"
+            )
+            return
+        await save_setting("intro_text", intro)
+        await client.send_message("me", f"✅ Текст о себе сохранён:\n{intro}")
+        return
+
+    # ── /add <chat_id или @username> ──────────────────────────────────────────
+    if text.startswith("/add"):
+        arg = text[4:].strip()
+        if not arg:
+            await client.send_message("me", "Укажи чат:\n`/add -1001234567890`\n`/add @freelance_ru`")
+            return
+        try:
+            # Если передан числовой ID
+            chat_id = int(arg)
+            title = str(chat_id)
+            try:
+                chat_obj = await client.get_chat(chat_id)
+                title = chat_obj.title or chat_obj.username or str(chat_id)
+            except Exception:
+                pass
+            await db_add_monitor_chat(chat_id, title)
+            await client.send_message("me", f"✅ Чат добавлен в мониторинг:\n**{title}** (`{chat_id}`)")
+        except ValueError:
+            # Это @username — резолвим в ID
+            username = arg.lstrip("@")
+            try:
+                chat_obj = await client.get_chat(username)
+                chat_id  = chat_obj.id
+                title    = chat_obj.title or chat_obj.username or username
+                await db_add_monitor_chat(chat_id, title)
+                await client.send_message("me", f"✅ Чат добавлен в мониторинг:\n**{title}** (`{chat_id}`)")
+            except Exception as e:
+                await client.send_message("me", f"❌ Чат не найден: @{username}\nОшибка: {e}")
+        return
+
+    # ── /remove <chat_id или @username> ───────────────────────────────────────
+    if text.startswith("/remove"):
+        arg = text[7:].strip()
+        if not arg:
+            await client.send_message("me", "Укажи чат:\n`/remove -1001234567890`\n`/remove @freelance_ru`")
+            return
+        try:
+            chat_id = int(arg)
+        except ValueError:
+            username = arg.lstrip("@")
+            try:
+                chat_obj = await client.get_chat(username)
+                chat_id  = chat_obj.id
+            except Exception as e:
+                await client.send_message("me", f"❌ Чат не найден: {e}")
+                return
+        await db_remove_monitor_chat(chat_id)
+        await client.send_message("me", f"✅ Чат `{chat_id}` удалён из мониторинга.")
+        return
+
+    # ── /settings ─────────────────────────────────────────────────────────────
+    if text.startswith("/settings"):
+        chats = await db_get_monitor_chats()
+        chats_str = (
+            "\n".join(f"  • {title or c_id} (`{c_id}`)" for c_id, title in chats)
+            if chats else "  (нет)"
+        )
+        portfolio = _cfg.get("portfolio_url") or "не задано"
+        intro     = _cfg.get("intro_text")    or "не задано"
+        await client.send_message(
+            "me",
+            f"⚙️ **Текущие настройки**\n\n"
+            f"📎 Портфолио:\n  {portfolio}\n\n"
+            f"✍️ Текст о себе:\n  {intro}\n\n"
+            f"📡 Мониторинг чатов ({len(chats)}):\n{chats_str}\n\n"
+            f"━━━━━━━━━━━━━\n"
+            f"Команды:\n"
+            f"`/portfolio <url>` — сменить портфолио\n"
+            f"`/intro <текст>` — сменить текст о себе\n"
+            f"`/add <id или @chat>` — добавить чат\n"
+            f"`/remove <id или @chat>` — убрать чат",
+        )
+        return
+
+    # ── /on и /off ────────────────────────────────────────────────────────────
     if text.startswith("/on") or text.startswith("/off"):
-        parts = text.split()
+        parts    = text.split()
         cmd      = parts[0]
         username = parts[1].lstrip("@").lower() if len(parts) > 1 else None
         if username:
@@ -440,15 +534,14 @@ async def handle_saved_message(client: Client, message: Message) -> None:
                 await client.send_message("me", f"Автоответ для @{username} выключен ❌")
         else:
             if cmd == "/on":
-                is_active = True
-                blocked_users.clear()
+                is_active = True; blocked_users.clear()
                 await client.send_message("me", "Автоответ для всех включён ✅")
             else:
                 is_active = False
                 await client.send_message("me", "Автоответ для всех выключен ❌")
         return
 
-    # ── Fallback: /write и /skip для режима без BOT_TOKEN ──
+    # ── /write и /skip (fallback без BOT_TOKEN) ───────────────────────────────
     if text.startswith("/write "):
         token = text[7:].strip()
         order = pending_orders.get(token)
@@ -470,15 +563,14 @@ async def handle_saved_message(client: Client, message: Message) -> None:
         return
 
     if text.startswith("/skip "):
-        token = text[6:].strip()
-        pending_orders.pop(token, None)
+        pending_orders.pop(text[6:].strip(), None)
         await client.send_message("me", "❌ Пропущено.")
         return
 
     if text.startswith("/"):
         return
 
-    # ── Обычные задачи (AI-агент) ──
+    # ── Обычные задачи (AI-агент) ─────────────────────────────────────────────
     await client.send_message("me", "⏳ Выполняю задачу...")
     try:
         result = await execute_task(client, text)
@@ -488,7 +580,7 @@ async def handle_saved_message(client: Client, message: Message) -> None:
         await client.send_message("me", f"❌ Ошибка: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  EXISTING: входящие личные сообщения (автоответ)
+#  ВХОДЯЩИЕ ЛИЧНЫЕ СООБЩЕНИЯ (автоответ)
 # ══════════════════════════════════════════════════════════════════════════════
 
 @app.on_message(filters.private & filters.incoming & ~filters.me)
@@ -498,14 +590,12 @@ async def handle_incoming(_: Client, message: Message) -> None:
     sender_username = (message.from_user.username or "").lower()
     if sender_username and sender_username in blocked_users:
         return
-
     user_id = message.from_user.id
     history = histories.setdefault(user_id, [])
     history.append({"role": "user", "content": message.text})
     if len(history) > MAX_HISTORY:
         histories[user_id] = history[-MAX_HISTORY:]
         history = histories[user_id]
-
     try:
         response = await asyncio.to_thread(
             groq_client.chat.completions.create,
@@ -526,23 +616,32 @@ async def handle_incoming(_: Client, message: Message) -> None:
 async def main() -> None:
     global me_id
     await init_db()
-    logger.info("DB initialised at %s", DB_PATH)
+    await load_settings_from_db()
+    logger.info("DB ready. Monitoring %d chat(s). Portfolio: %s",
+                len(_monitor_chats), _cfg.get("portfolio_url") or "not set")
 
     await app.start()
     me_id = (await app.get_me()).id
-    logger.info("Userbot started (me_id=%s). Monitoring %d chat(s).", me_id, len(MONITOR_CHATS))
+    logger.info("Userbot started (me_id=%s)", me_id)
 
     if notify_bot:
         await notify_bot.start()
         logger.info("Notify-bot started.")
     else:
-        logger.warning(
-            "TELEGRAM_BOT_TOKEN not set — inline buttons unavailable. "
-            "Use /write <token> and /skip <token> commands in Saved Messages."
-        )
+        logger.warning("TELEGRAM_BOT_TOKEN not set — using /write /skip fallback.")
+
+    # Приветствие при старте
+    portfolio = _cfg.get("portfolio_url") or "не задано"
+    chats     = await db_get_monitor_chats()
+    await app.send_message(
+        "me",
+        f"🤖 **Бот запущен!**\n\n"
+        f"📡 Мониторинг: {len(chats)} чат(ов)\n"
+        f"📎 Портфолио: {portfolio}\n\n"
+        f"Напиши `/settings` чтобы настроить всё."
+    )
 
     await idle()
-
     await app.stop()
     if notify_bot:
         await notify_bot.stop()
