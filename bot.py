@@ -274,16 +274,13 @@ async def handle_monitored(_: Client, message: Message) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 if notify_bot:
-    @notify_bot.on_message(filters.private)
+    @notify_bot.on_message()
     async def handle_bot_message(client: Client, message: Message) -> None:
-        # Реагируем только на владельца
-        if me_id and message.from_user.id != me_id:
-            await message.reply("Нет доступа.")
-            return
-
+        logger.info("BOT MSG from=%s text=%r",
+                    message.from_user.id if message.from_user else "?",
+                    (message.text or "")[:60])
         try:
             text = (message.text or "").strip()
-            logger.info("Bot cmd: %r", text[:80])
 
             # /start
             if text == "/start":
