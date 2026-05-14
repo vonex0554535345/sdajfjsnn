@@ -8,6 +8,7 @@ import aiosqlite
 
 from pyrogram import Client, filters, idle
 from pyrogram.types import Message
+from pyrogram.raw import functions as raw_fn
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -35,6 +36,24 @@ MAX_HISTORY    = int(os.environ.get("MAX_HISTORY", "20"))
 BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 DB_PATH        = os.environ.get("DB_PATH", "leads.db")
 
+SCAN_KEYWORDS = [
+    "дизайн заказ",
+    "веб дизайн фриланс",
+    "логотип заказ",
+    "фриланс дизайнер",
+    "заказать баннер",
+    "UI UX заказ",
+    "дизайн лендинг",
+    "дизайн работа",
+    "графический дизайн",
+    "брендинг заказ",
+    "иллюстрация заказ",
+    "презентация заказ",
+    "полиграфия заказ",
+    "Telegram дизайн",
+    "3D визуализация заказ",
+]
+
 # ── Clients ────────────────────────────────────────────────────────────────────
 groq_client = Groq(api_key=GROQ_API_KEY)
 app = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
@@ -52,6 +71,9 @@ pending_orders: dict[str, dict]       = {}
 
 _cfg: dict[str, str] = {"portfolio_url": "", "intro_text": ""}
 _monitor_chats: set  = set()
+
+_autoscan_task: asyncio.Task | None = None
+_autoscan_hours: int = 1
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  DATABASE
@@ -195,27 +217,92 @@ async def generate_letter(order_text: str) -> str:
     return resp.choices[0].message.content.strip()
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  SCAN: поиск и вступление в чаты
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def find_design_chats(keywords: list[str] | None = None, max_per_kw: int = 15) -> list[dict]:
+    if keywords is None:
+        keywords = SCAN_KEYWORDS
+    seen: set[int] = set()
+    found: list[dict] = []
+    for kw in keywords:
+        try:
+            result = await app.invoke(raw_fn.contacts.Search(q=kw, limit=max_per_kw))
+            for chat in result.chats:
+                username = getattr(chat, 'username', '') or ''
+                title    = getattr(chat, 'title', '')    or ''
+                members  = getattr(chat, 'participants_count', 0) or 0
+                if not username or not title or chat.id in seen:
+                    continue
+                seen.add(chat.id)
+                found.append({'username': username, 'title': title, 'members': members})
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            logger.error("scan search error %r: %s", kw, e)
+    return sorted(found, key=lambda x: x['members'], reverse=True)
+
+
+async def join_and_monitor(chats: list[dict], limit: int = 500) -> list[str]:
+    joined: list[str] = []
+    for info in chats[:limit]:
+        try:
+            try:
+                chat_obj = await app.join_chat(info['username'])
+            except Exception as join_err:
+                if "already" in str(join_err).lower():
+                    chat_obj = await app.get_chat(info['username'])
+                else:
+                    raise
+            await db_add_monitor_chat(chat_obj.id, info['title'])
+            joined.append(info['title'])
+            logger.info("Joined+monitoring: %s (id=%s)", info['title'], chat_obj.id)
+            await asyncio.sleep(random.uniform(6, 12))
+        except Exception as e:
+            logger.warning("Could not join %s: %s", info['username'], e)
+    return joined
+
+
+async def autoscan_loop() -> None:
+    while True:
+        logger.info("Autoscan: scanning...")
+        try:
+            chats = await find_design_chats()
+            joined = await join_and_monitor(chats)
+            if joined and ai_bot and me_id:
+                result = "\n".join(f"✅ {t}" for t in joined)
+                await ai_bot.send_message(me_id, f"🔍 Автосканирование завершено.\nВступил в:\n{result}")
+        except Exception as e:
+            logger.error("Autoscan loop error: %s", e)
+        logger.info("Autoscan: sleeping %dh", _autoscan_hours)
+        await asyncio.sleep(_autoscan_hours * 3600)
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def settings_text() -> str:
+    global _autoscan_task, _autoscan_hours
     chats = await db_get_monitor_chats()
     chats_str = (
         "\n".join(f"  {title or c_id}  |  {c_id}" for c_id, title in chats)
         if chats else "  нет"
     )
-    portfolio = _cfg.get("portfolio_url") or "не задано"
-    intro     = _cfg.get("intro_text")    or "не задано"
+    portfolio    = _cfg.get("portfolio_url") or "не задано"
+    intro        = _cfg.get("intro_text")    or "не задано"
+    scan_status  = f"каждые {_autoscan_hours}ч" if (_autoscan_task and not _autoscan_task.done()) else "выключен"
     return (
         "Настройки бота\n\n"
         f"Портфолио:\n  {portfolio}\n\n"
         f"О себе (для откликов):\n  {intro}\n\n"
+        f"Автосканирование: {scan_status}\n\n"
         f"Мониторинг чатов ({len(chats)}):\n{chats_str}\n\n"
         "Команды:\n"
         "/portfolio  — задать ссылку на портфолио\n"
         "/intro      — текст о себе для откликов\n"
-        "/add        — добавить чат в мониторинг\n"
+        "/add        — добавить чат вручную\n"
         "/remove     — убрать чат из мониторинга\n"
+        "/scan       — найти и вступить в чаты по дизайну\n"
+        "/autoscan   — автопоиск по расписанию\n"
         "/settings   — показать настройки"
     )
 
@@ -262,7 +349,7 @@ async def send_order_notification(message: Message) -> None:
         )
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  LEAD-HUNTER: MONITOR HANDLER (userbot слушает чаты)
+#  LEAD-HUNTER: MONITOR HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _is_monitored(_, __, message: Message) -> bool:
@@ -296,7 +383,9 @@ async def cmd_start(message: BotMessage) -> None:
         "/settings — текущие настройки\n"
         "/portfolio — задать портфолио\n"
         "/intro — текст о себе для откликов\n"
-        "/add — добавить чат в мониторинг\n"
+        "/scan — найти популярные дизайн-чаты и вступить\n"
+        "/autoscan — автопоиск чатов по расписанию\n"
+        "/add — добавить чат вручную\n"
         "/remove — убрать чат из мониторинга"
     )
 
@@ -334,6 +423,86 @@ async def cmd_intro(message: BotMessage) -> None:
         return
     await save_setting("intro_text", intro)
     await message.answer(f"Текст о себе сохранён:\n{intro}")
+
+@dp.message(Command("scan"))
+async def cmd_scan(message: BotMessage) -> None:
+    text = message.text or ""
+    arg  = text[5:].strip()
+    keywords = [k.strip() for k in arg.split(',')] if arg else None
+
+    await message.answer("Ищу чаты по дизайн-тематике, подожди...")
+    chats = await find_design_chats(keywords)
+
+    if not chats:
+        await message.answer(
+            "Ничего не найдено.\n"
+            "Можно задать свои ключевые слова:\n"
+            "/scan дизайн фриланс, логотип заказ"
+        )
+        return
+
+    top = chats[:15]
+    lines = "\n".join(
+        f"{i+1}. {c['title']} — {c['members']:,} уч."
+        for i, c in enumerate(top)
+    )
+    await message.answer(
+        f"Найдено {len(chats)} чатов. Топ {len(top)}:\n\n{lines}\n\n"
+        "Вступаю в первые 5 и добавляю в мониторинг..."
+    )
+
+    joined = await join_and_monitor(chats)
+
+    if joined:
+        result = "\n".join(f"✅ {t}" for t in joined)
+        await message.answer(f"Готово! Вступил и мониторю {len(joined)} чатов:\n{result}")
+    else:
+        await message.answer(
+            "Не удалось вступить ни в один новый чат.\n"
+            "Возможно, уже состоишь во всех найденных."
+        )
+
+@dp.message(Command("autoscan"))
+async def cmd_autoscan(message: BotMessage) -> None:
+    global _autoscan_task, _autoscan_hours
+    text = (message.text or "")[9:].strip()
+    parts = text.split()
+
+    if parts and parts[0] == "off":
+        if _autoscan_task and not _autoscan_task.done():
+            _autoscan_task.cancel()
+            _autoscan_task = None
+            await message.answer("Автосканирование выключено.")
+        else:
+            await message.answer("Автосканирование уже выключено.")
+        return
+
+    if parts and parts[0] == "on":
+        if len(parts) > 1:
+            try:
+                _autoscan_hours = max(1, int(parts[1]))
+            except ValueError:
+                pass
+        if _autoscan_task and not _autoscan_task.done():
+            await message.answer(
+                f"Автосканирование уже запущено (каждые {_autoscan_hours}ч).\n"
+                "Чтобы перезапустить с другим интервалом — сначала /autoscan off"
+            )
+            return
+        _autoscan_task = asyncio.create_task(autoscan_loop())
+        await message.answer(
+            f"Автосканирование включено.\n"
+            f"Каждые {_autoscan_hours}ч ищу все новые дизайн-чаты и вступаю в них без ограничений."
+        )
+        return
+
+    status = f"включено (каждые {_autoscan_hours}ч)" if (_autoscan_task and not _autoscan_task.done()) else "выключено"
+    await message.answer(
+        f"Автосканирование: {status}\n\n"
+        "/autoscan on — включить (каждые 1ч)\n"
+        "/autoscan on 2 — включить (каждые 2ч)\n"
+        "/autoscan off — выключить"
+    )
 
 @dp.message(Command("add"))
 async def cmd_add(message: BotMessage) -> None:
@@ -397,7 +566,9 @@ async def cmd_unknown(message: BotMessage) -> None:
     await message.answer(
         "Не понял команду.\n\n"
         "/settings — настройки\n"
-        "/add — добавить чат\n"
+        "/scan — автопоиск дизайн-чатов\n"
+        "/autoscan — поиск по расписанию\n"
+        "/add — добавить чат вручную\n"
         "/remove — убрать чат\n"
         "/portfolio — портфолио\n"
         "/intro — текст о себе"
