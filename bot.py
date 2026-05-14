@@ -31,7 +31,7 @@ DB_PATH        = os.environ.get("DB_PATH", "leads.db")
 # ── Clients ────────────────────────────────────────────────────────────────────
 groq_client = Groq(api_key=GROQ_API_KEY)
 app         = Client("userbot", api_id=API_ID, api_hash=API_HASH, session_string=SESSION_STRING)
-notify_bot  = Client("notifybot", bot_token=BOT_TOKEN) if BOT_TOKEN else None
+notify_bot  = Client("notifybot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN) if BOT_TOKEN else None
 
 # ── Runtime state ──────────────────────────────────────────────────────────────
 histories:      dict[int, list[dict]] = {}
