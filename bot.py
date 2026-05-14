@@ -36,19 +36,41 @@ MAX_HISTORY    = int(os.environ.get("MAX_HISTORY", "20"))
 BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 DB_PATH        = os.environ.get("DB_PATH", "leads.db")
 
-ALL_KEYWORDS = [
-    "дизайн заказ", "веб дизайн фриланс", "логотип заказ", "фриланс дизайнер",
-    "заказать баннер", "UI UX заказ", "дизайн лендинг", "дизайн работа",
-    "графический дизайн", "брендинг заказ", "иллюстрация заказ",
-    "презентация заказ", "полиграфия заказ", "Telegram дизайн",
-    "3D визуализация заказ", "дизайн сайта", "моушн дизайн", "motion design",
-    "SMM дизайн", "дизайн упаковки", "арт заказ", "freelance design",
-    "ищу дизайнера", "найти дизайнера", "заказ дизайнеру", "дизайн удаленно",
-    "дизайн проект", "дизайн чат", "фриланс биржа", "биржа фриланс",
-    "дизайн реклама", "корпоративный дизайн", "дизайн приложения",
-    "иконки заказ", "визитка заказ", "дизайн меню", "дизайн вывески",
-    "анимация заказ", "видеомонтаж заказ", "инфографика заказ",
-]
+def _build_keywords() -> list[str]:
+    from itertools import product as iproduct
+    topics   = ["дизайн", "дизайнер", "design", "designer", "graphic", "креатив", "creative"]
+    actions  = ["заказ", "фриланс", "freelance", "работа", "биржа", "чат", "группа",
+                "заказать", "нужен", "требуется", "ищу", "проект", "удалённо"]
+    niches   = ["веб", "web", "логотип", "logo", "баннер", "banner", "3D", "UI", "UX",
+                "бренд", "brand", "motion", "моушн", "анимация", "SMM", "полиграфия",
+                "упаковка", "иконки", "визитка", "инфографика", "лендинг", "сайт",
+                "приложение", "telegram", "instagram", "вывеска", "меню", "презентация"]
+    geo      = ["москва", "спб", "питер", "россия", "украина", "беларусь",
+                "казахстан", "ru", "ua", "kz", "by", "онлайн", "удалённо"]
+    queries: set[str] = set()
+    for t, a in iproduct(topics, actions):
+        queries.add(f"{t} {a}")
+        queries.add(f"{a} {t}")
+    for t, n in iproduct(topics, niches):
+        queries.add(f"{t} {n}")
+        queries.add(f"{n} {t}")
+    for n, a in iproduct(niches, actions):
+        queries.add(f"{n} {a}")
+    for t, g in iproduct(topics, geo):
+        queries.add(f"{t} {g}")
+    # hand-picked extras
+    extras = [
+        "фриланс биржа", "биржа фриланс", "freelance биржа",
+        "ищу дизайнера", "найти дизайнера", "заказ дизайнеру",
+        "дизайн чат", "дизайн сообщество", "design community",
+        "дизайнеры чат", "художники заказ", "иллюстратор заказ",
+    ]
+    queries.update(extras)
+    kw_list = list(queries)
+    random.shuffle(kw_list)
+    return kw_list
+
+ALL_KEYWORDS: list[str] = _build_keywords()
 _kw_index = 0
 
 # ── Clients ────────────────────────────────────────────────────────────────────
@@ -325,33 +347,46 @@ async def join_and_monitor(chats: list[dict], limit: int = 500) -> list[str]:
     return joined
 
 
-_KW_BATCH = 4  # keywords per iteration
+_KW_BATCH = 4  # keywords per 60-second iteration
 
 async def autoscan_loop() -> None:
-    global _kw_index
-    logger.info("Autoscan started — continuously rotating %d keywords", len(ALL_KEYWORDS))
+    global _kw_index, ALL_KEYWORDS
+    cycle = 0
+    logger.info("Autoscan started — %d unique queries, %d per minute", len(ALL_KEYWORDS), _KW_BATCH)
     while True:
-        # Take next batch of keywords, wrap around
-        batch = []
-        for i in range(_KW_BATCH):
-            batch.append(ALL_KEYWORDS[(_kw_index + i) % len(ALL_KEYWORDS)])
+        batch = [ALL_KEYWORDS[(_kw_index + i) % len(ALL_KEYWORDS)] for i in range(_KW_BATCH)]
         _kw_index = (_kw_index + _KW_BATCH) % len(ALL_KEYWORDS)
+        completed_cycle = _kw_index == 0  # wrapped around
 
-        logger.info("Autoscan: trying keywords %s", batch)
+        logger.info("Autoscan kw=%d/%d: %s", _kw_index, len(ALL_KEYWORDS), batch)
         try:
             chats = await find_design_chats(batch)
             if chats:
-                logger.info("Autoscan: %d new groups found", len(chats))
                 joined = await join_and_monitor(chats)
                 if joined and ai_bot and me_id:
                     result = "\n".join(f"✅ {t}" for t in joined)
-                    await ai_bot.send_message(me_id, f"🔍 Новые группы добавлены:\n{result}")
-            else:
-                logger.info("Autoscan: no new groups in this batch")
+                    await ai_bot.send_message(me_id, f"🔍 Новые группы ({len(joined)}):\n{result}")
         except Exception as e:
-            logger.error("Autoscan loop error: %s", e)
+            logger.error("Autoscan error: %s", e)
 
-        await asyncio.sleep(60)  # 60s between batches → full cycle ~10 min
+        if completed_cycle:
+            cycle += 1
+            logger.info("Autoscan: full cycle #%d done (%d seen total). Pausing 30 min for new groups to appear.", cycle, len(_seen_usernames))
+            # Re-shuffle keywords for next cycle so order varies
+            random.shuffle(ALL_KEYWORDS)
+            _kw_index = 0
+            if ai_bot and me_id:
+                try:
+                    await ai_bot.send_message(
+                        me_id,
+                        f"🔄 Цикл #{cycle} завершён. Просмотрено групп всего: {len(_seen_usernames)}.\n"
+                        "Пауза 30 мин, затем новый цикл поиска."
+                    )
+                except Exception:
+                    pass
+            await asyncio.sleep(1800)  # 30 min pause between full cycles
+        else:
+            await asyncio.sleep(60)
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
