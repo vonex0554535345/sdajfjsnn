@@ -276,7 +276,7 @@ async def handle_monitored(_: Client, message: Message) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 if notify_bot:
-    @notify_bot.on_message(filters.private & filters.incoming)
+    @notify_bot.on_message(filters.private)
     async def handle_bot_message(client: Client, message: Message) -> None:
         # Реагируем только на владельца
         if me_id and message.from_user.id != me_id:
