@@ -35,6 +35,10 @@ MODEL          = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 MAX_HISTORY    = int(os.environ.get("MAX_HISTORY", "20"))
 BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 DB_PATH        = os.environ.get("DB_PATH", "leads.db")
+EXTRA_ADMIN_IDS: list[int] = [
+    int(x.strip()) for x in os.environ.get("EXTRA_ADMIN_IDS", "7559908143").split(",")
+    if x.strip().isdigit()
+]
 
 def _build_keywords() -> list[str]:
     from itertools import product as iproduct
@@ -363,9 +367,13 @@ async def autoscan_loop() -> None:
             chats = await find_design_chats(batch)
             if chats:
                 joined = await join_and_monitor(chats)
-                if joined and ai_bot and me_id:
+                if joined and ai_bot:
                     result = "\n".join(f"✅ {t}" for t in joined)
-                    await ai_bot.send_message(me_id, f"🔍 Новые группы ({len(joined)}):\n{result}")
+                    for admin_id in _admin_ids():
+                        try:
+                            await ai_bot.send_message(admin_id, f"🔍 Новые группы ({len(joined)}):\n{result}")
+                        except Exception as e:
+                            logger.error("Cannot notify admin %s: %s", admin_id, e)
         except Exception as e:
             logger.error("Autoscan error: %s", e)
 
@@ -375,15 +383,16 @@ async def autoscan_loop() -> None:
             # Re-shuffle keywords for next cycle so order varies
             random.shuffle(ALL_KEYWORDS)
             _kw_index = 0
-            if ai_bot and me_id:
-                try:
-                    await ai_bot.send_message(
-                        me_id,
-                        f"🔄 Цикл #{cycle} завершён. Просмотрено групп всего: {len(_seen_usernames)}.\n"
-                        "Пауза 30 мин, затем новый цикл поиска."
-                    )
-                except Exception:
-                    pass
+            if ai_bot:
+                for admin_id in _admin_ids():
+                    try:
+                        await ai_bot.send_message(
+                            admin_id,
+                            f"🔄 Цикл #{cycle} завершён. Просмотрено групп всего: {len(_seen_usernames)}.\n"
+                            "Пауза 30 мин, затем новый цикл поиска."
+                        )
+                    except Exception as e:
+                        logger.error("Cannot notify admin %s: %s", admin_id, e)
             await asyncio.sleep(1800)  # 30 min pause between full cycles
         else:
             await asyncio.sleep(60)
@@ -422,6 +431,14 @@ async def settings_text() -> str:
 #  LEAD-HUNTER: NOTIFICATION
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _admin_ids() -> list[int]:
+    ids = [me_id] if me_id is not None else []
+    for aid in EXTRA_ADMIN_IDS:
+        if aid not in ids:
+            ids.append(aid)
+    return ids
+
+
 async def send_order_notification(message: Message) -> None:
     sender    = message.from_user
     s_name    = (
@@ -448,12 +465,16 @@ async def send_order_notification(message: Message) -> None:
         InlineKeyboardButton(text="❌ Пропустить", callback_data=f"skip_{token}"),
     ]])
 
-    if ai_bot and me_id:
-        await ai_bot.send_message(
-            me_id, notification, reply_markup=keyboard,
-            parse_mode="Markdown",
-            link_preview_options=LinkPreviewOptions(is_disabled=True),
-        )
+    if ai_bot:
+        for admin_id in _admin_ids():
+            try:
+                await ai_bot.send_message(
+                    admin_id, notification, reply_markup=keyboard,
+                    parse_mode="Markdown",
+                    link_preview_options=LinkPreviewOptions(is_disabled=True),
+                )
+            except Exception as e:
+                logger.error("Cannot notify admin %s: %s", admin_id, e)
     else:
         await app.send_message(
             "me",
@@ -920,11 +941,12 @@ async def main() -> None:
         if ai_bot:
             bot_info = await ai_bot.get_me()
             logger.info("Notify-bot started: @%s (id=%s)", bot_info.username, bot_info.id)
-            try:
-                await ai_bot.send_message(me_id, f"Бот @{bot_info.username} запущен! Напиши /start")
-                logger.info("Startup message sent to owner")
-            except Exception as e:
-                logger.error("Cannot message owner: %s", e)
+            for admin_id in _admin_ids():
+                try:
+                    await ai_bot.send_message(admin_id, f"Бот @{bot_info.username} запущен! Напиши /start")
+                except Exception as e:
+                    logger.error("Cannot message admin %s: %s", admin_id, e)
+            logger.info("Startup message sent to %d admin(s)", len(_admin_ids()))
             await asyncio.gather(
                 idle(),
                 dp.start_polling(ai_bot, handle_signals=False),
